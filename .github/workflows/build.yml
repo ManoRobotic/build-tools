@@ -1,0 +1,45 @@
+name: Build Exe
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          cd serial_server
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executables
+        run: |
+          cd serial_server
+          pyinstaller --onefile --clean --name "rzavala_dbf_uploader" rzavala_dbf_uploader.py
+          pyinstaller --onefile --clean --name "dbf_mapper" dbf_mapper.py
+
+      - name: Upload rzavala_dbf_uploader
+        uses: actions/upload-artifact@v4
+        with:
+          name: rzavala-dbf-uploader-exe
+          path: serial_server/dist/rzavala_dbf_uploader.exe
+          retention-days: 30
+
+      - name: Upload dbf_mapper
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbf-mapper-exe
+          path: serial_server/dist/dbf_mapper.exe
+          retention-days: 30
