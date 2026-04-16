@@ -12,6 +12,7 @@ Production Orders: opro.dbf + oprod.dbf
 Inventory Codes: remd.dbf
 """
 
+import re
 import requests
 import time
 import logging
@@ -55,11 +56,13 @@ if getattr(sys, 'frozen', False):
     OPRO_DBF_PATH = r"C:\ALPHAERP\Empresas\RZAVALA\opro.dbf"
     OPROD_DBF_PATH = r"C:\ALPHAERP\Empresas\RZAVALA\oprod.dbf"
     REMD_DBF_PATH = r"C:\ALPHAERP\Empresas\RZAVALA\remd.dbf"
+    PRODUCTO_DBF_PATH = r"C:\ALPHAERP\Empresas\RZAVALA\producto.dbf"
 else:
     application_path = os.path.dirname(os.path.abspath(__file__))
     OPRO_DBF_PATH = os.path.join(application_path, 'opro.dbf')
     OPROD_DBF_PATH = os.path.join(application_path, 'oprod.dbf')
     REMD_DBF_PATH = os.path.join(application_path, 'remd.dbf')
+    PRODUCTO_DBF_PATH = os.path.join(application_path, 'producto.dbf')
 
 # State files
 OPRO_STATE_FILE = os.path.join(application_path, "rzavala_opro_state.json")
@@ -79,6 +82,39 @@ class RzavalaDBFUploader:
         self.last_modified_state = self.load_last_modified_state()
         self.first_run = not os.path.exists(OPRO_STATE_FILE) and not os.path.exists(INVENTORY_STATE_FILE)
         self.sync_last_opro_from_api()
+
+    def convert_desc_to_bopptrans(self, desc: str) -> str:
+        """
+        Convierte DESC_PROD al formato BOPPTRANS esperado por el WMS.
+        Ej: "PELICULA BOPP 30X20 CMS" -> "BOPPTRANS 30 / 200"
+            "PELICULA BOPP 30X10.5 CMS" -> "BOPPTRANS 30 / 105"
+        El segundo valor se convierte de cm a mm (* 10).
+        """
+        m = re.search(r'(\d+(?:\.\d+)?)[Xx](\d+(?:\.\d+)?)\s*[Cc][Mm][Ss]?', desc)
+        if m:
+            a = m.group(1)
+            b = int(float(m.group(2)) * 10)
+            return f'BOPPTRANS {a} / {b}'
+        return desc  # fallback: usar DESC_PROD tal cual
+
+    def load_producto_catalog(self) -> Dict:
+        """Carga producto.dbf y retorna {CVE_PROD: product_key} donde product_key
+        está en formato BOPPTRANS para que el regex del WMS pueda extraer dimensiones."""
+        catalog = {}
+        if not os.path.exists(PRODUCTO_DBF_PATH):
+            logger.warning(f"producto.dbf no encontrado en {PRODUCTO_DBF_PATH} - se usará CVE_PROP como fallback")
+            return catalog
+        try:
+            dbf = DBF(PRODUCTO_DBF_PATH, encoding='latin-1', ignore_missing_memofile=True)
+            for r in dbf:
+                cve = str(r.get('CVE_PROD', '') or '').strip()
+                desc = str(r.get('DESC_PROD', '') or '').strip()
+                if cve and desc:
+                    catalog[cve] = self.convert_desc_to_bopptrans(desc)
+            logger.info(f"Cargado catálogo de productos: {len(catalog)} entradas")
+        except Exception as e:
+            logger.warning(f"Error cargando producto.dbf: {e} - se usará CVE_PROP como fallback")
+        return catalog
 
     def get_last_opro_from_api(self) -> int:
         """Get the last NO_OPRO from WMSys API"""
@@ -249,19 +285,22 @@ class RzavalaDBFUploader:
         except:
             return str(datetime.now().year)
 
-    def map_opro_record_to_api(self, record: Dict) -> Optional[Dict]:
+    def map_opro_record_to_api(self, record: Dict, producto_catalog: Dict = None) -> Optional[Dict]:
         """Map DBF record to API format for production orders"""
         try:
             cleaned = {k: self.clean_value(v) for k, v in record.items()}
             year = self.extract_year(cleaned)
             quantity = self.extract_quantity(cleaned)
 
-            # CVE_PROD (from oprod, merged) = clave real del producto en AlphaERP (ej: "BOPPTRANS 35 / 500")
-            # CVE_PROP (from opro/oprod)     = código interno maestro (ej: "PROMAT59477")
-            # Se prefiere CVE_PROD porque es el código legible que usa Rzavala externamente.
-            cve_prod = cleaned.get('CVE_PROD', '')
+            # Lookup en producto.dbf: opro.CVE_PROP -> producto.CVE_PROD -> producto.DESC_PROD
+            # DESC_PROD contiene el nombre legible (ej: "PELICULA BOPP 35X43 CMS")
+            # Fallback a CVE_PROP si no hay catálogo o no se encuentra la clave
             cve_prop = cleaned.get('CVE_PROP', '')
-            product_key = cve_prod or cve_prop
+            product_key = cve_prop  # fallback
+            if producto_catalog and cve_prop:
+                desc = producto_catalog.get(cve_prop, '')
+                if desc:
+                    product_key = desc
 
             no_opro = cleaned.get('NO_OPRO', '')
 
@@ -443,6 +482,7 @@ class RzavalaDBFUploader:
                 logger.info(f"Loaded {len(oprod_records)} records from oprod.dbf")
 
             all_records = self.merge_opro_oprod(opro_records, oprod_records)
+            producto_catalog = self.load_producto_catalog()
 
             processed_count = 0
             new_records = []
@@ -457,7 +497,7 @@ class RzavalaDBFUploader:
                 try:
                     current_opro_val = int(no_opro)
                     if current_opro_val > current_last_opro:
-                        mapped_record = self.map_opro_record_to_api(record)
+                        mapped_record = self.map_opro_record_to_api(record, producto_catalog)
                         if mapped_record:
                             new_records.append(mapped_record)
                             processed_count += 1
@@ -816,6 +856,7 @@ class RzavalaDBFUploader:
                 logger.info(f"Loaded {len(oprod_records)} records from oprod.dbf")
 
             all_records = self.merge_opro_oprod(opro_records, oprod_records)
+            producto_catalog = self.load_producto_catalog()
 
             update_payloads = []
             for record in all_records:
@@ -824,9 +865,12 @@ class RzavalaDBFUploader:
                 if not no_opro:
                     continue
 
-                cve_prod = cleaned.get('CVE_PROD', '')
                 cve_prop = cleaned.get('CVE_PROP', '')
-                product_key = cve_prod or cve_prop
+                product_key = cve_prop
+                if producto_catalog and cve_prop:
+                    desc = producto_catalog.get(cve_prop, '')
+                    if desc:
+                        product_key = desc
 
                 if product_key:
                     update_payloads.append({
