@@ -588,40 +588,43 @@ class RzavalaDBFUploader:
     # ============================================================================
 
     def map_inventory_record_to_api(self, record: Dict) -> Optional[Dict]:
-        """Map DBF record to API format for inventory codes"""
+        """
+        Map oprod.dbf record to API format for inventory codes.
+
+        oprod.dbf representa el consumo de materia prima por orden de producción:
+          NO_OPRO  → no_ordp   (número de orden)
+          CVE_PROP → cve_prod  (producto terminado fabricado)
+          CVE_PROD → cve_copr  (materia prima / componente consumido)
+          CAN_OP   → can_copr  (cantidad consumida)
+          LOTE_OP  → lote
+          UNDORD   → undres    (unidad de medida)
+          COSTO_OP → costo
+          CVE_SUC  → cve_suc
+        """
         try:
             cleaned = {k: self.clean_value(v) for k, v in record.items()}
 
-            # remd.dbf uses NO_REM instead of NO_ORDP
-            no_ordp = cleaned.get('NO_REM', cleaned.get('NO_ORDP', ''))
-            cve_prod = cleaned.get('CVE_PROD', '')
-            cve_copr = cleaned.get('CVE_COPR', cleaned.get('CVE_PROD', ''))
-            can_copr = cleaned.get('CAN_PROD', cleaned.get('CANT_SURT', '0'))
-            lote = cleaned.get('LOTE', cleaned.get('REF_LOTE', ''))
-            fech_cto = cleaned.get('FECH_ORDP', cleaned.get('FECH_REM', ''))
-            undres = cleaned.get('MED_PROD', '')
-            costo = cleaned.get('COST_PROM', '')
-            cve_suc = cleaned.get('CVE_SUC', '')
-            tip_copr = 1  # Default to active
+            no_ordp  = cleaned.get('NO_OPRO', '')
+            cve_prod = cleaned.get('CVE_PROP', '')   # producto terminado
+            cve_copr = cleaned.get('CVE_PROD', '')   # materia prima / componente
+            can_copr = cleaned.get('CAN_OP', '0')
+            lote     = cleaned.get('LOTE_OP', '')
+            undres   = cleaned.get('UNDORD', '')
+            costo    = cleaned.get('COSTO_OP', '')
+            cve_suc  = cleaned.get('CVE_SUC', '')
+            tip_copr = 1
 
             if not no_ordp:
-                logger.warning("Skipping record: NO_REM/NO_ORDP is empty")
+                logger.warning("Skipping oprod record: NO_OPRO is empty")
                 return None
 
             if not cve_prod:
-                logger.warning(f"Record with NO_REM/NO_ORDP {no_ordp} has empty CVE_PROD")
+                logger.warning(f"oprod NO_OPRO={no_ordp} has empty CVE_PROP")
                 return None
 
-            # Parse date if available
-            parsed_date = None
-            if fech_cto:
-                try:
-                    if 'T' in str(fech_cto):
-                        parsed_date = fech_cto.split('T')[0]
-                    else:
-                        parsed_date = fech_cto
-                except Exception:
-                    parsed_date = datetime.now().strftime('%Y-%m-%d')
+            if not cve_copr:
+                logger.warning(f"oprod NO_OPRO={no_ordp} has empty CVE_PROD (component)")
+                return None
 
             # Parse quantity
             try:
@@ -631,14 +634,13 @@ class RzavalaDBFUploader:
             except ValueError:
                 quantity = 1
 
-            # Parse cost if available
+            # Parse cost — límite DECIMAL(12,8): max 9999.99
             parsed_cost = None
             if costo:
                 try:
                     parsed_cost = float(costo)
-                    # Validate cost is within database limits (DECIMAL(12,8) = max 9999.99)
                     if parsed_cost >= 10000:
-                        logger.warning(f"Cost {parsed_cost} too large, skipping (max 9999.99)")
+                        logger.warning(f"Cost {parsed_cost} too large for NO_OPRO={no_ordp}, skipping cost")
                         parsed_cost = None
                 except ValueError:
                     pass
@@ -654,24 +656,20 @@ class RzavalaDBFUploader:
                 "cve_suc": cve_suc
             }
 
-            # Add optional fields if they have values
-            if parsed_date:
-                mapped["fech_cto"] = parsed_date
             if parsed_cost:
                 mapped["costo"] = parsed_cost
 
-            # Remove empty fields but keep required ones
+            # Quitar vacíos pero conservar campos requeridos
             mapped = {k: v for k, v in mapped.items() if v not in [None, '', 0] or k in ['tip_copr', 'can_copr']}
 
-            logger.debug(f"Mapped inventory record - NO_REM: {mapped.get('no_ordp')}, "
-                        f"Product: {mapped.get('cve_prod')}, "
-                        f"Quantity: {mapped.get('can_copr')}, "
-                        f"Unit: {mapped.get('undres')}")
+            logger.debug(f"Mapped oprod record - NO_OPRO: {no_ordp}, "
+                        f"Producto: {cve_prod}, Componente: {cve_copr}, "
+                        f"Cantidad: {quantity} {undres}")
 
             return mapped
 
         except Exception as e:
-            logger.error(f"Error mapping inventory record: {e}")
+            logger.error(f"Error mapping oprod inventory record: {e}")
             return None
 
     def send_inventory_batch_to_api(self, batch_data: List[Dict]) -> Dict:
@@ -736,28 +734,32 @@ class RzavalaDBFUploader:
         return {"success": False, "error": "Failed after retries"}
 
     def process_inventory_codes(self) -> bool:
-        """Process inventory codes from remd.dbf"""
+        """
+        Process inventory codes from oprod.dbf (consumo de materia prima por orden).
+        Solo procesa registros con NO_OPRO mayor al último procesado.
+        """
         try:
             logger.info("=" * 60)
-            logger.info("PROCESSING ZAVALA INVENTORY CODES")
+            logger.info("PROCESSING ZAVALA INVENTORY CODES (oprod.dbf)")
             logger.info("=" * 60)
 
-            if not os.path.exists(REMD_DBF_PATH):
-                logger.error(f"File not found: {REMD_DBF_PATH}")
+            if not os.path.exists(OPROD_DBF_PATH):
+                logger.error(f"File not found: {OPROD_DBF_PATH}")
                 return False
 
-            if not self.first_run and not self.has_file_changed(REMD_DBF_PATH):
-                logger.info("No changes detected in REMD DBF file")
+            if not self.first_run and not self.has_file_changed(OPROD_DBF_PATH):
+                logger.info("No changes detected in oprod.dbf")
                 return True
 
             if self.first_run:
                 logger.info("First run detected - will process all records")
 
-            logger.info(f"Opening DBF file: {REMD_DBF_PATH}")
-            dbf = DBF(REMD_DBF_PATH, ignore_missing_memofile=True)
-
-            # Log available fields for debugging
+            logger.info(f"Opening DBF file: {OPROD_DBF_PATH}")
+            dbf = DBF(OPROD_DBF_PATH, encoding='latin-1', ignore_missing_memofile=True)
             logger.info(f"DBF fields: {dbf.field_names}")
+
+            current_last = self.inventory_state.get('last_processed_no_ordp', 0)
+            logger.info(f"Starting from NO_OPRO > {current_last}")
 
             all_records = []
             processed_count = 0
@@ -765,6 +767,13 @@ class RzavalaDBFUploader:
 
             for record in dbf:
                 record_dict = dict(record)
+                no_opro_val = self.clean_value(record_dict.get('NO_OPRO', ''))
+                try:
+                    if int(no_opro_val) <= current_last:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+
                 mapped_record = self.map_inventory_record_to_api(record_dict)
                 if mapped_record:
                     all_records.append(mapped_record)
@@ -772,15 +781,12 @@ class RzavalaDBFUploader:
                 else:
                     skipped_count += 1
 
-                    if processed_count % 100 == 0:
-                        logger.info(f"Processed {processed_count} records so far...")
-
             logger.info(f"Prepared {len(all_records)} valid inventory records for sending (skipped {skipped_count})")
 
-            all_records.sort(key=lambda x: str(x.get('no_ordp', '0')))
+            all_records.sort(key=lambda x: int(str(x.get('no_ordp', '0'))) if str(x.get('no_ordp', '0')).isdigit() else 0)
 
             if not all_records:
-                logger.info("No valid inventory records to send")
+                logger.info("No new inventory records to send")
                 self.save_inventory_state()
                 return True
 
@@ -806,12 +812,12 @@ class RzavalaDBFUploader:
             logger.info(f"Total inventory codes sent: {successful_sends}/{total_records}")
 
             if all_records:
-                # Use NO_REM for state tracking (remd.dbf uses NO_REM)
-                max_no_rem = max([int(r['no_ordp']) for r in all_records if str(r['no_ordp']).isdigit()], default=0)
-                if max_no_rem > self.inventory_state.get('last_processed_no_ordp', 0):
-                    self.inventory_state['last_processed_no_ordp'] = max_no_rem
+                # Trackear por NO_OPRO (oprod.dbf usa NO_OPRO igual que opro.dbf)
+                max_no_opro = max([int(r['no_ordp']) for r in all_records if str(r['no_ordp']).isdigit()], default=0)
+                if max_no_opro > self.inventory_state.get('last_processed_no_ordp', 0):
+                    self.inventory_state['last_processed_no_ordp'] = max_no_opro
                     self.save_inventory_state()
-                    logger.info(f"Updated last_processed_no_ordp to {max_no_rem}")
+                    logger.info(f"Updated last_processed_no_ordp to {max_no_opro}")
 
             self.save_last_modified_state()
             self.first_run = False
